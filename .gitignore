@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.log
+*.raw
+*.h5
+*.hdf5
+*.csv
+neuromorphic-drivers/
