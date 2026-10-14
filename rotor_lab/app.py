@@ -453,7 +453,7 @@ def main(argv=None):
     p.add_argument('--no-overlays',action='store_true')
     p.add_argument('--headless',action='store_true',help='Process without image rendering')
     p.add_argument('--no-window',action='store_true',help='Render/capture without opening a window, useful for software tests')
-    p.add_argument('--duration',type=float,default=0,help='Seconds. Record mode defaults to 30 s; live mode has no limit')
+    p.add_argument('--duration',type=float,default=0,help='Live-capture seconds after initialization. Record mode defaults to 60 s; live mode has no limit. Replay reads the full file.')
     p.add_argument('--after','--photo-after',dest='after',type=float,default=5,help='Photo mode: seconds after first event preview')
     p.add_argument('--photos-every',type=float,default=0,help='Optional repeated native snapshots, interval in seconds')
     p.add_argument('--name',default='',help='Descriptive run label, timestamp is always added')
@@ -472,7 +472,7 @@ def main(argv=None):
     if a.demo and a.replay:p.error('Choose synthetic or replay, not both')
     if a.mode=='record':
         a.record=True;a.video=True
-        if not a.duration:a.duration=30
+        if not a.duration:a.duration=60
     if a.no_events:a.record=False
     auto_report=a.report or a.video or a.mode=='photo'
     try:

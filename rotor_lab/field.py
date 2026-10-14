@@ -320,7 +320,11 @@ def record(args):
     print(f'Lens {args.lens:g} mm | measured range {args.distance:g} m | declared fixed focus {args.focus_m:g} m',flush=True)
     print(f'Aspect: {args.aspect} | profile: {args.profile} | repeat: {args.repeat}',flush=True)
     print('Target ABSENT for at least 6 seconds after live imagery begins. Press 1 at target entry; 2 at exit.',flush=True)
-    print('Keep target in view about 10 seconds. S = native photo. Q = stop early.',flush=True)
+    print(f'Capture: {args.duration:g} seconds. Use ONE 1/2 marker pair. S = native photo. Q = stop early.',flush=True)
+    if args.duration >= 60:
+        print('Suggested schedule: 0-10 s absent, about 10-45 s present, then absent until finish.',flush=True)
+    else:
+        print('Keep target in view about 10 seconds after the initial target-free interval.',flush=True)
     cmd=[sys.executable,str(ROOT/'app.py'),'record','--duration',str(args.duration),'--photos-every','5',
          '--activity-preset',getattr(args,'activity_preset','sensitive'),'--period-input',getattr(args,'period_input','native'),
          '--config',str(ROOT/'settings.json'),'--run-dir',str(out),'--notes',json.dumps(meta)]
@@ -355,25 +359,45 @@ def bundle(run: Path):
     print('Original events.evs and raw/dashboard video remain in:',run)
 
 
+def recording_path(value):
+    """Resolve the latest distance trial or an explicit event file/run folder."""
+    if value == 'latest':
+        path = resolve_run('latest') / 'events.evs'
+    else:
+        path = Path(value).expanduser().resolve()
+        if path.is_dir():
+            path = path / 'events.evs'
+    if not path.is_file():
+        raise ValueError(f'Original event recording not found: {path}')
+    return path
+
+
 def main(argv=None):
     argv=list(sys.argv[1:] if argv is None else argv)
-    commands={'live','demo','check','summary','review','replay','bundle','record','test','compare'}
+    # Forward all original app options without duplicating its argument parser.
+    # capture = a generic video+event recording, not a scored distance trial.
+    if argv and argv[0] in ('capture', 'photo'):
+        mode = 'record' if argv[0] == 'capture' else 'photo'
+        return subprocess.call([sys.executable, str(ROOT/'app.py'), mode, *argv[1:]], cwd=ROOT)
+    commands={'live','demo','check','summary','review','replay','bundle','record','test','compare','verify','capture','photo'}
     if argv and argv[0] not in commands and not argv[0].startswith('-'):argv.insert(0,'record')
-    p=argparse.ArgumentParser(description=__doc__)
+    p=argparse.ArgumentParser(description=__doc__, epilog='Run from the repository root with bash run.sh. Distance trials and capture default to 60 seconds. capture/photo forward app.py options. Use absolute recording paths or latest (the last distance trial).')
     sub=p.add_subparsers(dest='command')
     for n in ['live','demo','check','summary','test']:
         cp=sub.add_parser(n)
+        if n == 'check':
+            cp.add_argument('--seconds', type=positive, default=5.)
         if n in ('live','demo'):
             cp.add_argument('--activity-preset',choices=['baseline','sensitive'],default='sensitive')
             cp.add_argument('--period-input',choices=['native','neighbor'],default='native')
-    for n in ['review','bundle']:
+    for n in ['review','bundle','verify']:
         c=sub.add_parser(n);c.add_argument('run',nargs='?',default='latest')
-    c=sub.add_parser('compare');c.add_argument('path');c.add_argument('--period-input',choices=['native','neighbor'],default='native');c.add_argument('--annotations')
-    c=sub.add_parser('replay');c.add_argument('path')
+    c=sub.add_parser('compare');c.add_argument('path',nargs='?',default='latest');c.add_argument('--period-input',choices=['native','neighbor'],default='native');c.add_argument('--annotations')
+    c=sub.add_parser('replay');c.add_argument('path',nargs='?',default='latest')
     c.add_argument('--activity-preset',choices=['baseline','sensitive'],default='sensitive')
     c.add_argument('--period-input',choices=['native','neighbor'],default='native')
     c=sub.add_parser('record');c.add_argument('lens',type=positive);c.add_argument('distance',type=positive)
-    c.add_argument('--focus-m',type=positive,default=20.0);c.add_argument('--duration',type=positive,default=30.)
+    c.add_argument('--focus-m',type=positive,default=20.0);c.add_argument('--duration',type=positive,default=60.,help='Live-capture seconds, default 60; minimum 20 for a distance trial')
     c.add_argument('--f-number',type=positive);c.add_argument('--lux',type=positive);c.add_argument('--target',default='known test drone')
     c.add_argument('--aspect',choices=['front','oblique','side','rear'],default='front',help='Operator-declared aircraft orientation; not estimated by the camera')
     c.add_argument('--profile',choices=['hover','crossing'],default='hover')
@@ -383,20 +407,22 @@ def main(argv=None):
     c.add_argument('--period-input',choices=['native','neighbor'],default='native')
     a=p.parse_args(argv)
     if a.command=='compare':
-        cmd=[sys.executable,str(ROOT/'compare_activity.py'),a.path,'--period-input',a.period_input]
+        cmd=[sys.executable,str(ROOT/'compare_activity.py'),str(recording_path(a.path)),'--period-input',a.period_input]
         if a.annotations:cmd+=['--annotations',a.annotations]
         return subprocess.call(cmd,cwd=ROOT)
+    if a.command=='verify':
+        result=verify(resolve_run(a.run))
+        print(json.dumps(result,indent=2))
+        return 0 if result.get('status')=='PASS' else 1
     if a.command=='record':return record(a)
     if a.command=='summary':summarize();return 0
     if a.command=='review':review(resolve_run(a.run));summarize();return 0
     if a.command=='bundle':bundle(resolve_run(a.run));return 0
-    if a.command=='check':cmd=['doctor.py','--camera','--seconds','5']
+    if a.command=='check':cmd=['doctor.py','--camera','--seconds',str(a.seconds)]
     elif a.command=='test':cmd=['-m','unittest','discover','-s','tests','-v']
     elif a.command=='demo':cmd=['app.py','demo','--duration','4']
     elif a.command=='replay':
-        path=Path(a.path).expanduser()
-        if path.is_dir():path=path/'events.evs'
-        cmd=['app.py','replay',str(path.resolve())]
+        cmd=['app.py','replay',str(recording_path(a.path))]
     else:cmd=['app.py','live']
     if cmd and cmd[0]=='app.py':
         cmd+=['--activity-preset',getattr(a,'activity_preset','sensitive'),'--period-input',getattr(a,'period_input','native')]

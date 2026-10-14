@@ -1,344 +1,167 @@
-# EVK4 Real-Time Activity Detection
+# EVK4 Real-Time Detection
 
-Simple research code for using a Prophesee EVK4 event camera as a live activity detector.
+Live event-based activity cueing with a Prophesee EVK4. The current GUI and
+experiments are in **`rotor_lab/`**. The original terminal prototypes are
+preserved in **`legacy/`**. Run the current application from this repository,
+not from an older Downloads copy.
 
-The current code does not classify drones yet. It reads the EVK4 event stream live, checks for abnormal localized activity, and can raise a persistent `TARGET_ACTIVITY` flag.
+The purpose is to cue observation from raw activity first and add periodic
+and possible-drone evidence when available. This is an experimental sensor,
+not a validated drone classifier. No range, depth, or angular bearing is inferred.
 
-## What works now
+## Start
 
-- EVK4 detected over USB 3 at 5 Gb/s
-- Live asynchronous events from `neuromorphic_drivers`
-- Event rate monitoring
-- 5 ms live event chunks
-- 32 x 18 spatial activity grid
-- Short startup baseline calibration
-- Local abnormal activity detection
-- Real-time health checks for driver delay and backlog
-- Simple persistent activity state and primitive tracking
-
-Current flow:
-
-```text
-EVK4
-  -> USB 3
-  -> neuromorphic_drivers
-  -> live (x, y, timestamp, polarity) events
-  -> 5 ms chunks
-  -> 32 x 18 activity grid
-  -> compare against learned baseline
-  -> candidate ROI
-  -> persistence check
-  -> TARGET_ACTIVITY = 1 or 0
-```
-
-## Tested setup
-
-This project was developed on:
-
-```text
-macOS 15.1
-Apple Silicon arm64
-Python 3.10.18
-Prophesee EVK4
-neuromorphic_drivers 0.17.0
-numpy 2.2.6
-```
-
-## Repo files
-
-```text
-camera_smoke_test.py
-    Confirms the camera opens and prints live events per second.
-
-live_activity_v01.py
-    First live detector. Finds one abnormal localized ROI from 5 ms event chunks.
-
-rt_test.py
-    Runs the v0.1 detector headless and reports event rate, driver delay, backlog, and stale-data clears.
-
-live_activity_v02.py
-    Adds IDLE, PENDING, and ACTIVE states plus primitive ROI association and tracking.
-
-requirements.txt
-    Main Python dependencies.
-
-requirements-viewer.txt
-    Optional dependencies for the neuromorphic-drivers example viewer.
-
-tools/patch_neuromorphic_viewer_macos.py
-    Optional patch for the upstream example viewer when using PySide6 6.11.x on macOS.
-```
-
-## 1. Put the repo on your Mac
-
-If you downloaded this project as a zip:
+Close any other EVK4 program. From the repository root:
 
 ```bash
-cd ~/Downloads
-unzip evk4-realtime-detection.zip
-mv evk4-realtime-detection ~/evk4-realtime-detection
 cd ~/evk4-realtime-detection
+bash run.sh test
+bash run.sh check
+bash run.sh
 ```
 
-If it is already in the folder you want, just `cd` into it.
+The launcher reuses a compatible existing Python environment and does not
+install or upgrade packages. The camera check is a short acquisition/recording
+check; a PASS does not establish drone detection. Unit tests and synthetic
+inputs do not establish physical-camera or aircraft performance.
 
-## 2. Create the Python environment
+If automatic environment discovery fails, point to the Python executable
+in your working camera environment. For example, only when this path exists:
 
-From the repo folder:
+```bash
+export EVK4_PYTHON="$HOME/Downloads/evk4_distance_test/.venv/bin/python"
+bash run.sh check
+```
+
+For a NEW installation only, while online:
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+.venv/bin/python -m pip install -r requirements.txt
 ```
 
-When the environment is active, Terminal should show `(.venv)` near the prompt.
+The previously recorded Mac setup used Python 3.10.18, NumPy 2.2.6, Numba
+0.61.2, OpenCV 4.12.0.88, neuromorphic_drivers 0.17.0, and Matplotlib 3.10.8.
+The pinned application requirements remain unchanged. Do not upgrade a working
+environment immediately before collection.
 
-Every time you open a new Terminal later:
+## Commands
 
-```bash
-cd ~/evk4-realtime-detection
-source .venv/bin/activate
-```
+All commands below are run from the repository root.
 
-## 3. Plug in the EVK4
+| Task | Command |
+|---|---|
+| Run software tests | `bash run.sh test` |
+| Check camera and recording | `bash run.sh check` |
+| Open live GUI | `bash run.sh` |
+| Synthetic GUI demo | `bash run.sh demo` |
+| Generic 60 s event and video recording | `bash run.sh capture --name bench` |
+| Record with an extra native photo every 5 s | `bash run.sh capture --name bench --photos-every 5` |
+| 25 mm lens at measured 20 m, 60 s distance trial | `bash run.sh 25 20 --focus-m 20 --aspect front` |
+| Override a distance trial to 90 s | `bash run.sh 25 20 --duration 90 --aspect front` |
+| Verify the latest distance trial | `bash run.sh verify latest` |
+| Review the latest distance trial | `bash run.sh review latest` |
+| Replay the latest distance trial | `bash run.sh replay latest` |
+| Compare raw presets on the same latest events | `bash run.sh compare latest` |
+| Build cross-run CSV and plots | `bash run.sh summary` |
+| Save one native photo set after 5 s | `bash run.sh photo --after 5 --name snapshot` |
 
-Plug the EVK4 directly into the Mac with a USB 3 capable cable.
+`latest` means the last **distance trial**, not the last generic capture,
+preflight, or replay. For another recording, pass its absolute run-folder or
+`events.evs` path. The launcher runs the app inside `rotor_lab/`, so relative
+paths to data are resolved there. Use absolute paths outside that folder.
 
-Check that macOS sees it:
+Generic `capture` forwards the original app record options, including
+`--duration`, `--photos-every`, `--rgb`, `--notes`, `--run-dir`, `--no-events`,
+and `--activity-preset`. A generic capture is not automatically scored as a
+distance experiment. `capture --help` shows the app options.
 
-```bash
-system_profiler SPUSBDataType
-```
+## One minute means acquisition time
 
-You want to see something similar to:
+Generic record mode and distance trials default to **60 seconds**. Use
+`--duration 30`, `--duration 60`, or `--duration 90` to choose another positive
+live-capture duration. A scored distance trial requires at least 20 seconds.
+
+The timer starts after live-source setup. Compilation, camera initialization,
+shutdown, file verification, review, and graph generation can make the command
+last longer. Movies start at the first fresh preview and use a nominal frame
+rate. Their playback length is not guaranteed to equal 60 seconds if frames
+are skipped. Use `video_frames.csv` and event timestamps for analysis.
+
+Live monitoring without recording has no time limit. Replay reads its complete
+source file. Photo mode uses `--after`, not `--duration`. The camera preflight
+remains a short diagnostic, normally 5 seconds.
+
+## What the three flags mean
+
+- **ACTIVITY:** fresh persistent neighboring raw-event pixels, with A-number boxes.
+  This does not require a rotor signature.
+- **ROTOR EVIDENCE:** fresh confirmed localized periodic evidence, with P-number
+  boxes and white supported pixels. It is not guaranteed prop-only segmentation.
+- **DRONE CANDIDATE:** an explainable but unvalidated rule using associated raw
+  activity and periodicity plus motion or multiple periodic regions.
+
+No rotor evidence must not suppress ACTIVITY. An UNKNOWN identity is compatible
+with a useful ACTIVITY cue. Missing/stale/invalid input is UNAVAILABLE, not a
+confident negative. Coasting alone is not fresh positive evidence.
+
+The yellow/blue view is recent event polarity. The white view is periodicity
+selected within the 80-1200 Hz band, not a brightness threshold. The histogram
+counts supported pixels, not FFT amplitude or confidence. Paths are image-plane
+patch histories, not physical position or a count of drones.
+
+Details: [ACTIVITY_FIRST.md](rotor_lab/ACTIVITY_FIRST.md).
+
+## Recording and results
+
+All new data lives under **`rotor_lab/captures/`**. Existing Downloads recordings
+are not moved or deleted. A distance trial records both views in the same run.
 
 ```text
-EVK4
-Manufacturer: Prophesee
-Speed: Up to 5 Gb/s
+rotor_lab/captures/<unique_run>/
+    events.evs              Original decoded events, not EVT3 RAW
+    dashboard.mp4           Combined GUI preview
+    raw_events.mp4          Clean yellow/blue preview
+    filtered_events.mp4     Clean white/black preview
+    video_frames.csv        Video frame timestamps and validity
+    photos/                 Native snapshots and numerical evidence
+    session.json            Actual settings, versions, and source identity
+    telemetry.jsonl         Decisions, measurements, thresholds, and health
+    cues.jsonl              Image-coordinate tracks and three flags
+    summary.json            Input loss and processing/recording diagnostics
+    trial.json              Lens/range/aspect metadata for distance trials
+    review.json             Operator observations for distance trials
+    code_used/              Source captured with the distance trial
 ```
 
-Then check that the Python driver sees it:
+Videos can fall back to AVI. At 5 million events/s, 60 s of decoded 13-byte
+records is approximately 3.9 GB before videos. Monitor storage and verify
+recordings before leaving the site. A clean file is not a correct detection.
+
+`summary` creates `rotor_lab/captures/results/`. Only verified, reviewed live
+distance trials appear in its figures. Raw/filtered visibility and cue-on-target
+association require review. Whole-view rates/counts are not segmented target
+measurements. A single run per condition is not detection probability.
+
+## Tonight's test plan
+
+Follow [docs/TESTING.md](docs/TESTING.md). Keep the camera fixed and thresholds
+unchanged during a sweep. Record one target-present/absent marker pair per trial.
+Compare settings on identical recorded events before selecting a new default.
+
+## Updating main
+
+Use main directly as requested. Inspect before staging:
 
 ```bash
-python -c "import neuromorphic_drivers as nd; nd.print_device_list()"
+git status --short --branch
+git diff
 ```
 
-You want to see the Prophesee EVK4 with USB 3.0 SuperSpeed.
-
-## 4. Basic camera test
-
-Run:
-
-```bash
-python camera_smoke_test.py
-```
-
-Move your hand in front of the camera.
-
-The event rate should increase when something moves and decrease when the scene becomes still.
-
-Stop with:
-
-```text
-Ctrl+C
-```
-
-## 5. Run v0.1 activity detection
-
-Run:
-
-```bash
-python live_activity_v01.py
-```
-
-Keep the camera still for the first few seconds while it learns the normal activity in each region.
-
-After calibration, moving something through the field of view should produce output like:
-
-```text
-*** CANDIDATE ACTIVITY DETECTED ***
-time: 12085000 us | events: 9025 | score: 537.9
-ROI: x=1000:1120, y=600:720
-```
-
-This means the code found a local area producing much more event activity than its learned baseline.
-
-This is not drone classification. It is live abnormal activity detection.
-
-## 6. Check whether the system is actually real time
-
-Run:
-
-```bash
-python rt_test.py
-```
-
-Typical healthy output looks like:
-
-```text
-rate= 2.91 Mev/s | delay= 0.86 ms | backlog= 0 | clears=0
-rate= 1.12 Mev/s | delay= 0.11 ms | backlog= 0 | clears=0
-```
-
-Important fields:
-
-```text
-rate
-    Millions of decoded events per second.
-
-delay
-    Approximate software delay between incoming camera data and our Python consumer.
-
-backlog
-    Waiting driver data. We want this near zero.
-
-clears
-    Number of times stale queued data had to be dropped.
-```
-
-For real-time detection, low delay and low backlog are more important than processing every old event.
-
-## 7. Run v0.2 persistent activity tracking
-
-Run:
-
-```bash
-python live_activity_v02.py
-```
-
-Again, keep the camera still during startup calibration.
-
-v0.2 adds three states:
-
-```text
-IDLE
-  -> candidate appears
-PENDING
-  -> repeated nearby activity
-ACTIVE
-  -> TARGET_ACTIVITY = 1
-```
-
-Example:
-
-```text
-TARGET_ACTIVITY = 1
-track_id: 4
-ROI: (400, 240, 520, 360)
-```
-
-While active, the code prints occasional track center and velocity estimates.
-
-When related activity disappears:
-
-```text
-TARGET_ACTIVITY = 0
-reason: no_associated_activity
-```
-
-The current tracker is intentionally primitive. It follows the strongest abnormal patch, so its position and velocity can jump. That is a known limitation, not a finished object tracker.
-
-## Optional live viewer
-
-The detector does not need a rendered image. The viewer is only useful for understanding and debugging the event stream.
-
-Install the optional GUI dependency:
-
-```bash
-python -m pip install -r requirements-viewer.txt
-```
-
-Clone the upstream driver repo next to this project or inside a temporary folder:
-
-```bash
-cd ~/evk4-realtime-detection
-git clone --depth 1 https://github.com/neuromorphicsystems/neuromorphic-drivers.git
-cd neuromorphic-drivers/python/examples
-```
-
-The PySide6 6.11.x example needed a small compatibility patch on the Mac used for this project. Run:
-
-```bash
-python ~/evk4-realtime-detection/tools/patch_neuromorphic_viewer_macos.py
-python -m py_compile ui.py
-python any_display.py
-```
-
-The viewer is optional. The headless detector is the important real-time path.
-
-## What the code is doing
-
-The camera produces asynchronous events rather than normal frames:
-
-```text
-(x, y, t, polarity)
-```
-
-The detector groups those events into 5 ms processing windows. It then bins the 1280 x 720 sensor into a 32 x 18 grid.
-
-During startup it learns the mean and variance of normal event counts in each grid cell.
-
-During operation it asks:
-
-```text
-Is one local part of the sensor much more active than normal?
-```
-
-If yes, it creates a candidate region of interest.
-
-v0.2 then asks whether nearby candidate activity persists through several windows before raising the target activity flag.
-
-## Current limitations
-
-- It does not know whether the target is a drone.
-- It currently chooses the strongest abnormal local patch.
-- The v0.2 tracker can jump between different active parts of one object.
-- Thresholds are experimental and still need tuning.
-- Camera motion, lighting changes, background motion, and sensor noise still need more testing.
-
-## Next development step
-
-The next useful version is v0.3:
-
-```text
-active grid cells
-  -> connected spatial clusters
-  -> cluster bounding boxes and centroids
-  -> associate clusters over time
-  -> stable tracks
-```
-
-After stable tracking, drone-specific detection can be investigated using the raw event timing inside the tracked region.
-
-## Git setup
-
-To start tracking this folder with Git:
-
-```bash
-cd ~/evk4-realtime-detection
-git init
-git add .
-git commit -m "Initial EVK4 real-time activity detector"
-```
-
-Create an empty repository on GitHub, then connect it. Replace the example URL with your repository URL:
-
-```bash
-git branch -M main
-git remote add origin https://github.com/YOUR-USERNAME/YOUR-REPO.git
-git push -u origin main
-```
-
-After you change code later:
-
-```bash
-git status
-git add .
-git commit -m "Describe what changed"
-git push
-```
-
-That is the normal loop for keeping the project updated.
+Stage only the specific files changed, review `git diff --cached`, commit, then
+`git push origin main`. Do not use force-push or `git add .` for experiment data.
+Environments, captures, common credentials, and large sensor/video files are
+ignored. Ignore patterns do not remove a file already tracked by Git.
+
+The old export manifest is provenance of the GUI import, not the file list for
+future commits. You no longer need to export from Downloads on each update.

@@ -80,7 +80,7 @@ class AnalysisTests(unittest.TestCase):
         with patch.object(field,'record',return_value=0) as fn:
             field.main(['25','10'])
         a=fn.call_args.args[0]
-        self.assertEqual(a.lens,25);self.assertEqual(a.distance,10);self.assertEqual(a.duration,30)
+        self.assertEqual(a.lens,25);self.assertEqual(a.distance,10);self.assertEqual(a.duration,60)
 
 class RoundTripResultTests(unittest.TestCase):
     def fixture(self, root):

@@ -1,3 +1,6 @@
+For the current root launch command and one-minute test sequence, see
+[repository README](../README.md) and [testing guide](../docs/TESTING.md).
+
 # Activity-first patch: run instructions
 
 This patch targets the supplied `evk4_sep15_baseline` application. It does not
@@ -106,7 +109,7 @@ one comparison. This is not a new frequency band or motor-only segmentation.
 bash test.sh 25 10 --aspect front --activity-preset sensitive
 ```
 
-This means an actual 25 mm lens, measured 10 m range, 30 seconds, original events,
+This means an actual 25 mm lens, measured 10 m range, 60 seconds by default, original events,
 raw/filtered/dashboard movies and native snapshots every 5 s. The declared focus
 distance defaults to 20 m; the operator must physically set the lens. Override
 with `--focus-m` when the actual setting differs. Optional `--duration`,
@@ -117,8 +120,8 @@ Target absent for 6 s after live imagery begins. Press 1 at presentation, 2 on
 exit. Keep the same aspect and approximate hover interval. Answer the original
 short visibility/periodic-cue review afterward, using unsure rather than guessing.
 The current frequency histogram counts pixels, not spectrum amplitude or belief.
-Original event data is preserved at 13 bytes/event before overhead: 30 s at
-5 million events/s is about 1.95 GB, before video.
+Original event data is preserved at 13 bytes/event before overhead: 60 s at
+5 million events/s is about 3.9 GB, before video.
 
 Additional output: `cues.jsonl` contains sensor time in microseconds, host receipt
 context, A/P track ID, native image box/center, validity, all three flags, evidence

@@ -1,2 +1,2 @@
-neuromorphic_drivers==0.17.0
-numpy==2.2.6
+# Current GUI dependencies. Install only when creating a new environment.
+-r rotor_lab/requirements.txt

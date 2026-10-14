@@ -1,10 +1,33 @@
+# Environments and generated Python/Numba files
 .venv/
+venv/
 __pycache__/
-*.pyc
+*.py[cod]
+*.nbc
+*.nbi
+.pytest_cache/
 .DS_Store
-*.log
+
+# Local experiments, generated reports, and recorded sensor/video data
+captures/
+*.evs
 *.raw
 *.h5
 *.hdf5
 *.csv
+*.mp4
+*.avi
+*.mov
+*.log
+rotor_lab/validation/
 neuromorphic-drivers/
+
+# Do not commit credentials or machine-specific configuration
+.env
+.env.*
+*.pem
+*.key
+*.token
+secrets/
+credentials/
+.activity_patch_state.json

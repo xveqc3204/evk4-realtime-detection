@@ -1,0 +1,2 @@
+neuromorphic_drivers==0.17.0
+numpy==2.2.6
