@@ -1,0 +1,694 @@
+"""EVK4 Rotor Lab: live raw events, per-pixel frequency filtering, and flags.
+
+Run with `bash run.sh`. Start without hardware with `bash run.sh --demo`.
+This is a passive periodic-activity experiment. A positive flag is NOT a
+validated drone identity. See README.md and ALGORITHM.md.
+"""
+from __future__ import annotations
+
+import argparse
+from collections import deque
+from dataclasses import asdict
+import importlib.metadata
+import json
+import math
+import multiprocessing as mp
+from pathlib import Path
+import platform
+import queue
+import sys
+import threading
+import time
+import traceback
+import uuid
+
+import numpy as np
+from rotor import Settings, PeriodFilter, PatchTracker, group_pixels, reduce_frequency, load_settings
+from event_io import LiveSource, FileSource, DemoSource, Recorder
+from synthetic import QuadSource
+from activity import RawActivity, NeighborSupport, load_activity_settings, evidence_flags, FLAG_NAMES
+
+from ui import draw_frame, clean_panels, History, is_fresh, CANVAS_W, CANVAS_H
+from media import MediaWriter, save_photo
+ROOT=Path(__file__).resolve().parent
+
+
+def json_line(fh,value):
+    fh.write(json.dumps(value,allow_nan=False,separators=(',',':'))+'\n')
+
+
+def newest(q,value):
+    """Bounded best-effort publication. Never wait on the GUI."""
+    try:q.put_nowait(value);return True
+    except queue.Full:
+        try:q.get_nowait()
+        except queue.Empty:return False
+        try:q.put_nowait(value);return True
+        except queue.Full:return False
+
+
+def percentile(xs,p):
+    return float(np.percentile(xs,p)) if xs else None
+
+
+def worker(options, settings, snapshots, commands, stop, photo_queue=None):
+    a=argparse.Namespace(**options);cfg=Settings(**settings).validate();out=Path(a.run_dir)
+    stats=dict(events_received=0,packets=0,evaluations=0,source_clears=0,overflow_packets=0,
+               timestamp_resets=0,invalid_coordinates=0,processing_overruns=0,
+               preview_skips=0,periodic_confirmations=0,max_driver_delay_ms=0.0,max_backlog_seen=0,
+               max_event_kernel_ms=0.0,max_map_group_ms=0.0)
+    summary=dict(status='STARTING',observed_input_loss=False)
+    fh=None;rec=None;engine=None;tracks=PatchTracker(cfg)
+    raw_preset=getattr(a,'activity_preset','sensitive')
+    raw_config=getattr(a,'activity_config',str(ROOT/'activity_presets.json'))
+    activity_cfg=load_activity_settings(raw_config,raw_preset)
+    period_input=getattr(a,'period_input','native')
+    activity=None;neighbor=None;cue_fh=None;cue_states={};last_cue_t=-10**18
+    latest_evidence=None;settings_revision=0
+    stats.update(activity_confirmations=0,drone_candidate_transitions=0)
+
+    state=False;last_t=None;last_publish=-math.inf;last_snapshot=None
+    photo_request=None
+    delay_hist=deque(maxlen=2000);kernel_hist=deque(maxlen=2000);group_hist=deque(maxlen=2000)
+
+    def publish(snap):
+        snap=dict(snap)
+        snap.setdefault('flags',{k:None for k in FLAG_NAMES})
+        snap.setdefault('activity_preset',raw_preset)
+        snap.setdefault('period_input',period_input)
+        snap.update(published_monotonic=time.monotonic(),band=[cfg.min_hz,cfg.max_hz],
+                    notches=list(cfg.notches_hz),synthetic=a.demo,replay=bool(a.replay),
+                    recording_error=None if rec is None else rec.error)
+        # Single producer, single consumer. Never read a large snapshot back
+        # from our own multiprocessing queue: doing so can block on its feeder.
+        try:snapshots.put_nowait(snap)
+        except queue.Full:stats['preview_skips']+=1
+
+    def log(row):
+        row.setdefault('host_unix',time.time())
+        row.setdefault('host_monotonic',time.monotonic())
+        if fh:json_line(fh,row)
+
+    def set_flag(value,reason):
+        nonlocal state
+        if value!=state:
+            state=bool(value)
+            log(dict(type='rotor_candidate',value=state,reason=reason,t_us=last_t,
+                     identity='unverified_periodic_source'))
+            # Preserve the historical log key quietly; the three new flags are the operator output.
+            if state:stats['periodic_confirmations']+=1
+
+    def set_evidence(value, reason='decision'):
+        nonlocal latest_evidence,last_cue_t,cue_states
+        previous={} if latest_evidence is None else latest_evidence['flags']
+        changed=previous != value['flags']
+        if changed:
+            log(dict(type='flags',t_us=last_t,**value,reason=reason))
+            if value['flags'].get('ACTIVITY') and not previous.get('ACTIVITY'):stats['activity_confirmations']+=1
+            if value['flags'].get('DRONE_CANDIDATE') and not previous.get('DRONE_CANDIDATE'):stats['drone_candidate_transitions']+=1
+            print(' | '.join(k+'='+('UNAVAILABLE' if value['flags'][k] is None else str(int(value['flags'][k])))
+                           for k in FLAG_NAMES)+' | '+(value['unknown_reason'] or value['identity']),flush=True)
+        latest_evidence=value
+        if cue_fh is None:return
+        current={o['track_id']:o for o in value['objects']}
+        if changed:
+            json_line(cue_fh,dict(type='status',sensor_t_us=last_t,host_unix=time.time(),
+                         flags=value['flags'],unknown_reason=value['unknown_reason'],reason=reason))
+        stamp=last_t if last_t is not None else 0
+        heartbeat=stamp-last_cue_t>=100000
+        for tid in sorted(set(cue_states)|set(current)):
+            obj=current.get(tid)
+            old=cue_states.get(tid)
+            if obj is None:
+                obj=dict(old,flags={k:(None if value['flags'][k] is None else False) for k in FLAG_NAMES},
+                         reasons=[reason if changed else 'track_lost'])
+            if heartbeat or old is None or tid not in current or obj['flags']!=old['flags']:
+                json_line(cue_fh,dict(type='cue',sensor_t_us=last_t,host_unix=time.time(),
+                       host_monotonic=time.monotonic(),valid_for_ms=cfg.silence_ms,
+                       coordinates='native_image_pixels',timestamp_unit='microseconds',
+                       flags_valid=all(v is not None for v in value['flags'].values()),
+                       unknown_reason=value['unknown_reason'],**obj))
+        cue_states=current
+        if heartbeat:last_cue_t=stamp
+
+    def reset(reason):
+        nonlocal last_snapshot
+        last_snapshot=None
+        if engine:engine.reset()
+        if activity:activity.reset(background=reason in ('user_reset','roi_changed','sensor_clock_backwards'))
+        if neighbor:neighbor.reset()
+        tracks.reset();set_flag(False,reason)
+        set_evidence(evidence_flags({},[],last_t,activity_cfg,valid=False),reason)
+        log(dict(type='reset',reason=reason,t_us=last_t))
+        publish(dict(kind='status',status='RESET: '+reason,flag=False,tracks=[]))
+
+    try:
+        fh=(out/'telemetry.jsonl').open('x',buffering=1)
+        cue_fh=(out/'cues.jsonl').open('x',buffering=1)
+        publish(dict(kind='status',status='COMPILING_PERIOD_FILTER',flag=False,tracks=[]))
+        # Compile BEFORE opening USB. First-time JIT must not accumulate a camera backlog.
+        warm=PeriodFilter(cfg,2,2);warm.compile();del warm
+        if a.demo:
+            if a.scenario.startswith('quad'):
+                publish(dict(kind='status',status='BUILDING_SYNTHETIC_SCENE',flag=False,tracks=[]))
+                source=QuadSource(a.duration or 6,not a.unpaced,a.demo_hz,a.scenario)
+                # Added raw baseline needs a target-free interval in this demo.
+                source.spec.start_s=max(source.spec.start_s,activity_cfg.warmup_ms/1000+0.25)
+            else:
+                source=DemoSource(a.duration or 10,not a.unpaced,a.demo_hz,a.scenario)
+        elif a.replay:source=FileSource(a.replay,not a.unpaced)
+        else:source=LiveSource()
+        # Preserve the v0.3 detector. Only move expensive live setup before USB.
+        # Never forgive/drop startup data silently or increase the delay budget.
+        host_platform=platform.platform()
+        host_versions={}
+        for name in ['numpy','numba','opencv-python','neuromorphic_drivers','matplotlib']:
+            try:host_versions[name]=importlib.metadata.version(name)
+            except importlib.metadata.PackageNotFoundError:host_versions[name]='not installed'
+        is_live=not a.demo and not a.replay
+        if is_live:
+            engine=PeriodFilter(cfg,int(getattr(source,'width',1280)),int(getattr(source,'height',720)))
+            engine.compile()
+            if a.roi:engine.set_roi(a.roi)
+            activity=RawActivity(activity_cfg,engine.width,engine.height);activity.compile()
+            neighbor=NeighborSupport(engine.width,engine.height,activity_cfg.neighbor_us)
+            from rotor import EVENT_DTYPE
+            neighbor.compile(EVENT_DTYPE)
+        source_open_start=time.monotonic()
+        with source:
+            source_entered=time.monotonic()
+            if is_live:
+                if (int(source.width),int(source.height))!=(engine.width,engine.height):
+                    raise RuntimeError('Prepared sensor geometry differs from opened source')
+            else:
+                engine=PeriodFilter(cfg,source.width,source.height)
+                if a.roi:engine.set_roi(a.roi)
+                activity=RawActivity(activity_cfg,engine.width,engine.height);activity.compile()
+                neighbor=NeighborSupport(engine.width,engine.height,activity_cfg.neighbor_us)
+                from rotor import EVENT_DTYPE
+                neighbor.compile(EVENT_DTYPE)
+            metadata=dict(application='EVK4 Rotor Lab 0.3',source_info=source.info,
+                          settings=cfg.to_dict(),roi=engine.roi,notes=a.notes,
+                          platform=host_platform,python=sys.version,created_unix=time.time(),
+                          method='per-pixel ON/OFF burst onset periods + spatially coherent evidence mask',
+                          gui_convention='ON yellow, OFF blue, qualified pixels white on black',
+                          source_started_monotonic=time.monotonic(),
+                          command_options={k:v for k,v in vars(a).items() if k != 'run_dir'},
+                          identity='ROTOR_CANDIDATE means unverified periodic source',
+                          event_format='EVK4DET1, decoded 13-byte records, not EVT3 RAW',
+                          rgb='Optional unsynchronized comparison, never detector input')
+            metadata['versions']=host_versions
+            metadata.update(activity_patch='activity-first-v1',activity_preset=raw_preset,
+                 activity_settings=activity_cfg.to_dict(),period_input=period_input,
+                 flags=list(FLAG_NAMES),legacy_rotor_candidate='Compatibility name for ROTOR_EVIDENCE, not DRONE_CANDIDATE')
+            import hashlib
+            metadata['code_sha256']={n:hashlib.sha256((ROOT/n).read_bytes()).hexdigest()
+                 for n in ('app.py','rotor.py','activity.py','ui.py','event_io.py','activity_presets.json')}
+            if a.replay:
+                original_summary=Path(a.replay).parent/'summary.json'
+                if original_summary.exists():
+                    metadata['replay_source_summary']=json.loads(original_summary.read_text())
+                    if metadata['replay_source_summary'].get('observed_input_loss'):
+                        print('REPLAY WARNING: original recording reports data loss. Missing events cannot be recovered.',flush=True)
+            metadata['startup_patch']='v03-init-order-only'
+            (out/'session.json').write_text(json.dumps(metadata,indent=2))
+            if a.record:rec=Recorder(out/'events.evs',metadata)
+            print(f"Source: {source.info.get('source')} | {source.width}x{source.height}",flush=True)
+            print(f'Band {cfg.min_hz:g}-{cfg.max_hz:g} Hz | {cfg.cycles} cycles | '
+                  f'{cfg.min_pixels} supported pixels | no learned classifier',flush=True)
+            if cfg.notches_hz:print(f'Excluded frequencies: {cfg.notches_hz} +/- {cfg.notch_width_hz:g} Hz',flush=True)
+            start=rate_start=time.monotonic();last_receive=start;rate_count=0;rate=0.0
+            eval_t=None;last_sensor_watermark=None;idle=False;last_idle_publish=0;backlog_max=0
+            publish(dict(kind='status',status='WAITING_FOR_EVENTS',flag=False,tracks=[]))
+            log(dict(type='startup_ready',patch='v03-init-order-only',
+                     camera_open_ms=(source_entered-source_open_start)*1000,
+                     post_open_setup_ms=(time.monotonic()-source_entered)*1000,
+                     max_delay_ms=cfg.max_delay_ms,max_backlog=cfg.max_backlog))
+            for pkt in source:
+                now=time.monotonic()
+                if stop.is_set() or (not a.demo and not a.replay and a.duration and now-start>=a.duration):break
+                while True:
+                    try:command=commands.get_nowait()
+                    except queue.Empty:break
+                    if command['type']=='photo':
+                        photo_request=command['id']
+                    elif command['type'] in ('activity_preset','period_input'):
+                        if a.record or getattr(a,'video',False):
+                            log(dict(type='control_rejected',reason='recording_settings_locked',control=command['type']))
+                            continue
+                        if command['type']=='activity_preset':
+                            raw_preset='baseline' if raw_preset=='sensitive' else 'sensitive'
+                            activity_cfg=load_activity_settings(raw_config,raw_preset)
+                            activity.cfg=activity_cfg;activity.reset()
+                        else:
+                            period_input='neighbor' if period_input=='native' else 'native'
+                            engine.reset_periods();tracks.reset();neighbor.reset()
+                        settings_revision+=1
+                        log(dict(type='settings_changed',t_us=last_t,activity_preset=raw_preset,
+                                 activity_settings=activity_cfg.to_dict(),period_input=period_input,
+                                 settings_revision=settings_revision))
+                    elif command['type']=='reset':reset('user_reset');eval_t=None
+                    elif command['type']=='roi':
+                        reset('roi_changed');engine.set_roi(command['roi']);eval_t=None
+                        log(dict(type='roi',roi=engine.roi))
+                ev=pkt.events;n=0 if ev is None else len(ev)
+                stats['packets']+=1;stats['events_received']+=n;rate_count+=n
+                if stats['packets']==1:
+                    log(dict(type='first_packet',delay_ms=pkt.delay_ms,backlog=pkt.backlog,
+                             overflow=pkt.overflow,event_count=n))
+                if pkt.delay_ms is not None:
+                    delay_hist.append(pkt.delay_ms)
+                    stats['max_driver_delay_ms']=max(stats['max_driver_delay_ms'],pkt.delay_ms)
+                stats['max_backlog_seen']=max(stats['max_backlog_seen'],pkt.backlog)
+                backlog_max=max(backlog_max,pkt.backlog)
+                if rec and n:rec.submit(ev)
+                if pkt.overflow or (pkt.delay_ms is not None and pkt.delay_ms>cfg.max_delay_ms) or pkt.backlog>cfg.max_backlog:
+                    log(dict(type='input_gap',packet_index=stats['packets'],
+                             delay_ms=pkt.delay_ms,backlog=pkt.backlog,overflow=pkt.overflow,
+                             loop_elapsed_ms=(now-start)*1000))
+                    stats['overflow_packets']+=int(pkt.overflow)
+                    source.clear();stats['source_clears']+=1;summary['observed_input_loss']=True
+                    reset('input_overflow_or_backlog');eval_t=None
+                    publish(dict(kind='status',status='INPUT_GAP',flag=False,tracks=[],backlog=pkt.backlog,
+                                 delay_ms=pkt.delay_ms))
+                    continue
+                progressed=pkt.t_us is not None and (last_sensor_watermark is None or pkt.t_us>last_sensor_watermark)
+                if n or progressed:
+                    last_receive=now;idle=False
+                    if pkt.t_us is not None:last_sensor_watermark=pkt.t_us
+                if now-last_receive>cfg.silence_ms/1000:
+                    if not idle:reset('no_recent_data');idle=True;eval_t=None
+                    if now-last_idle_publish>.25:
+                        publish(dict(kind='status',status='NO_RECENT_DATA',flag=False,tracks=[]))
+                        last_idle_publish=now
+                    continue
+                packet_start=time.perf_counter()
+                if n:
+                    try:
+                        eligibility=neighbor.mask(ev) if period_input=='neighbor' else None
+                        invalid=engine.push(ev,period_eligible=eligibility)
+                    except ValueError as exc:
+                        stats['timestamp_resets']+=1;reset('invalid_or_out_of_order_events');eval_t=None
+                        summary['observed_input_loss']=True
+                        log(dict(type='invalid_packet',detail=str(exc)))
+                        publish(dict(kind='status',status='INVALID_PACKET',flag=False,tracks=[]))
+                        continue
+                    stats['invalid_coordinates']+=invalid
+                    if invalid:
+                        summary['observed_input_loss']=True;reset('invalid_event_coordinates');eval_t=None
+                        continue
+                    kernel_ms=(time.perf_counter()-packet_start)*1000
+                    kernel_hist.append(kernel_ms)
+                    stats['max_event_kernel_ms']=max(stats['max_event_kernel_ms'],kernel_ms)
+                watermark=max(engine.latest_t, -1 if pkt.t_us is None else pkt.t_us)
+                if watermark<0:continue
+                last_t=int(watermark)
+                if eval_t is None:eval_t=last_t
+                if last_t<eval_t:
+                    reset('sensor_clock_backwards');eval_t=last_t;stats['timestamp_resets']+=1
+                    continue
+                if last_t-eval_t>=cfg.update_ms*1000:
+                    analyze_start=time.perf_counter()
+                    raw,freq=engine.maps(last_t)
+                    regions,status,global_fraction,supported=group_pixels(freq,cfg,engine.roi,return_map=True)
+                    if status=='RUN':current_tracks=tracks.update(regions,last_t)
+                    else:tracks.reset();current_tracks=[]
+                    rotor_status=status
+                    value=bool(status=='RUN' and any(t['confirmed'] and t['state']!='COASTING' for t in current_tracks))
+                    raw_result=activity.update(engine.last_event,last_t,engine.roi)
+                    # Frequency rejection cannot suppress a valid raw activity cue.
+                    status='RUN'
+                    evidence=evidence_flags(raw_result,current_tracks,last_t,activity_cfg,rotor_status=rotor_status)
+                    preliminary_ms=(time.perf_counter()-packet_start)*1000+(pkt.delay_ms or 0)
+                    if not a.demo and not a.replay and preliminary_ms>cfg.max_delay_ms:
+                        value=False;status='PROCESSING_OVERRUN';tracks.reset();current_tracks=[]
+                        evidence=evidence_flags(raw_result,[],last_t,activity_cfg,valid=False)
+                    set_evidence(evidence)
+                    set_flag(value,'persistent_periodic_patch' if value else 'no_recent_periodic_support')
+                    compute_ms=(time.perf_counter()-analyze_start)*1000
+                    group_hist.append(compute_ms);stats['evaluations']+=1;eval_t=last_t
+                    stats['max_map_group_ms']=max(stats['max_map_group_ms'],compute_ms)
+                    hist,edges=np.histogram(supported[supported>0],bins=64,range=(cfg.min_hz,cfg.max_hz))
+                    log(dict(type='decision',t_us=last_t,status=status,rotor_candidate=value,
+                             flags=evidence['flags'],identity=evidence['identity'],unknown_reason=evidence['unknown_reason'],
+                             reason_detail=evidence['detail'],objects=evidence['objects'],raw_activity=raw_result,
+                             rotor_status=rotor_status,activity_preset=raw_preset,period_input=period_input,
+                             settings_revision=settings_revision,
+                             stable_pixels=int(np.count_nonzero(freq)), frequency_histogram=hist.tolist(),
+                             periodic_pixels=int(np.count_nonzero(supported)),tile_fraction=global_fraction,
+                             tracks=current_tracks,delay_ms=pkt.delay_ms,backlog=pkt.backlog,
+                             map_and_group_ms=compute_ms))
+                    # Frequency estimates from each pixel, NOT an FFT spectrum.
+                    last_snapshot=dict(kind='frame',status=status,flag=value,raw=raw,
+                        flags=evidence['flags'],identity=evidence['identity'],unknown_reason=evidence['unknown_reason'],
+                        reason_detail=evidence['detail'],activity_tracks=raw_result['tracks'],
+                        raw_activity=raw_result,activity_preset=raw_preset,period_input=period_input,
+                        rotor_status=rotor_status,settings_revision=settings_revision,
+                        frequency=reduce_frequency(supported),tracks=current_tracks,t_us=last_t,
+                        stable_pixels=int(np.count_nonzero(freq)),evaluated_monotonic=time.monotonic(),
+                        source_started_monotonic=start,
+                        width=engine.width,height=engine.height,roi=engine.roi,
+                        periodic_pixels=int(np.count_nonzero(supported)),tile_fraction=global_fraction,
+                        histogram=hist,edges=edges,delay_ms=pkt.delay_ms,backlog=pkt.backlog,
+                        rate_mev_s=rate,map_ms=compute_ms)
+                    if photo_request is not None and photo_queue is not None and status!='PROCESSING_OVERRUN':
+                        capture=dict(request_id=photo_request,raw_native=engine.raw_native(last_t),
+                                     frequency_native=supported,cycle_only_frequency=freq,
+                                     snapshot=dict(last_snapshot,synthetic=a.demo,replay=bool(a.replay),
+                                                   band=[cfg.min_hz,cfg.max_hz],notches=list(cfg.notches_hz)))
+                        try:
+                            photo_queue.put_nowait(capture)
+                            log(dict(type='photo_captured',id=photo_request,t_us=last_t))
+                        except queue.Full:log(dict(type='photo_failed',id=photo_request,reason='photo queue full'))
+                        photo_request=None
+                # Soft real-time watchdog, not a deadline guarantee. Never silently
+                # publish an old positive result after a long processing stall.
+                spent_ms=(time.perf_counter()-packet_start)*1000
+                if not a.demo and not a.replay and spent_ms+(pkt.delay_ms or 0)>cfg.max_delay_ms:
+                    stats['processing_overruns']+=1
+                    source.clear();stats['source_clears']+=1;summary['observed_input_loss']=True
+                    reset('processing_overrun');last_snapshot=None;eval_t=None
+                    publish(dict(kind='status',status='PROCESSING_OVERRUN',flag=False,tracks=[]))
+                    continue
+                now=time.monotonic()
+                if last_snapshot is not None and now-last_publish>=1/cfg.preview_hz:
+                    publish(last_snapshot);last_publish=now
+                if now-rate_start>=1:
+                    rate=rate_count/(now-rate_start)/1e6
+                    health=dict(type='health',rate_mev_s=rate,driver_p95_ms=percentile(delay_hist,95),
+                                driver_max_ms=max(delay_hist) if delay_hist else None,
+                                event_kernel_p95_ms=percentile(kernel_hist,95),
+                                map_and_group_p95_ms=percentile(group_hist,95),max_backlog=backlog_max,
+                                source_clears=stats['source_clears'],recording_error=None if rec is None else rec.error)
+                    log(health)
+                    print('HEALTH | rate=%.2f Mev/s | driver_p95=%s ms | map_p95=%s ms | backlog_max=%d | clears=%d | rotor_evidence=%d' %
+                          (rate,'n/a' if health['driver_p95_ms'] is None else f"{health['driver_p95_ms']:.2f}",
+                           'n/a' if health['map_and_group_p95_ms'] is None else f"{health['map_and_group_p95_ms']:.2f}",backlog_max,
+                           stats['source_clears'],int(state)),flush=True)
+                    if rec and rec.error:print('RECORDING INCOMPLETE: '+rec.error,flush=True)
+                    rate_start=now;rate_count=0;backlog_max=0
+                    delay_hist.clear();kernel_hist.clear();group_hist.clear()
+            summary['status']='STOPPED' if stop.is_set() or not (a.demo or a.replay) else 'SOURCE_ENDED'
+    except KeyboardInterrupt:
+        summary['status']='STOPPED'
+    except BaseException as exc:
+        summary.update(status='ERROR',error=f'{type(exc).__name__}: {exc}')
+        traceback.print_exc()
+    finally:
+        set_flag(False,'source_stopped')
+        set_evidence(evidence_flags({},[],last_t,activity_cfg,valid=False),'source_stopped')
+        if rec:summary.update(rec.close())
+        summary.update(stats,ended_unix=time.time())
+        summary['recording_requested']=bool(a.record)
+        summary['no_observed_recording_loss']=bool(a.record and not summary.get('recording_error') and
+            not summary['observed_input_loss'] and stats['invalid_coordinates']==0 and summary['status']!='ERROR')
+        summary['completeness_note']='No observed loss is not proof of sensor-level losslessness. Read telemetry gap records.'
+        (out/'summary.json').write_text(json.dumps(summary,indent=2))
+        log(dict(type='run_end',**summary))
+        if fh:fh.close()
+        if cue_fh:cue_fh.close()
+        publish(dict(kind='status',status=summary['status'],error=summary.get('error'),flag=False,tracks=[]))
+        # Do not cancel the feeder for large NumPy snapshots. Exiting with a
+        # half-written pickle can strand the GUI in get_nowait(). The parent
+        # drains both queues during shutdown before joining this process.
+
+
+class RGBReader:
+    """Optional reference video. Host receipt time is NOT exposure time."""
+    def __init__(self,index):
+        self.index=index;self.frame=None;self.received=None;self.error=None
+        self.stop=threading.Event();self.thread=threading.Thread(target=self._run,daemon=True)
+        self.thread.start()
+    def _run(self):
+        import cv2
+        cap=cv2.VideoCapture(self.index,cv2.CAP_AVFOUNDATION if sys.platform=='darwin' else cv2.CAP_ANY)
+        if not cap.isOpened():self.error=f'RGB {self.index} did not open';return
+        try:
+            while not self.stop.is_set():
+                ok,frame=cap.read()
+                if ok:self.frame=frame;self.received=time.monotonic()
+                else:self.error='RGB read failed';time.sleep(.05)
+        finally:cap.release()
+
+
+
+def main(argv=None):
+    p=argparse.ArgumentParser(description='EVK4 Rotor Lab 0.3: live periodic evidence and experiment capture.')
+    p.add_argument('mode',nargs='?',choices=['live','demo','photo','record','replay'],default='live')
+    p.add_argument('path',nargs='?',help='EVK4DET1 events.evs for replay mode')
+    p.add_argument('--demo',action='store_true',help='Use an explicitly synthetic source in any mode')
+    p.add_argument('--replay',help='Replay events.evs instead of opening the camera')
+    p.add_argument('--config',default=str(ROOT/'settings.json'))
+    p.add_argument('--activity-preset',choices=['baseline','sensitive'],default='sensitive',help='Raw support only. Rotor settings unchanged.')
+    p.add_argument('--activity-config',default=str(ROOT/'activity_presets.json'))
+    p.add_argument('--period-input',choices=['native','neighbor'],default='native',help='Optional 1 ms neighbor noise test on period branch only')
+    p.add_argument('--band',nargs=2,type=float,metavar=('LOW_HZ','HIGH_HZ'))
+    p.add_argument('--notch',nargs='+',type=float)
+    p.add_argument('--roi',nargs=4,type=int,metavar=('X0','Y0','X1','Y1'))
+    p.add_argument('--record',action='store_true',help='Save original decoded events')
+    p.add_argument('--no-events',action='store_true',help='Explicitly disable large event recording in record mode')
+    p.add_argument('--video',action='store_true',help='Save dashboard, raw-event and filtered-event movies')
+    p.add_argument('--rgb',type=int,help='Optional unsynchronized conventional-camera index')
+    p.add_argument('--stripped',action='store_true',help='Start with the filtered view only')
+    p.add_argument('--no-overlays',action='store_true')
+    p.add_argument('--headless',action='store_true',help='Process without image rendering')
+    p.add_argument('--no-window',action='store_true',help='Render/capture without opening a window, useful for software tests')
+    p.add_argument('--duration',type=float,default=0,help='Seconds. Record mode defaults to 30 s; live mode has no limit')
+    p.add_argument('--after','--photo-after',dest='after',type=float,default=5,help='Photo mode: seconds after first event preview')
+    p.add_argument('--photos-every',type=float,default=0,help='Optional repeated native snapshots, interval in seconds')
+    p.add_argument('--name',default='',help='Descriptive run label, timestamp is always added')
+    p.add_argument('--run-dir',help='New output folder; never overwritten')
+    p.add_argument('--notes',default='')
+    p.add_argument('--report',action='store_true',help='Export CSVs and presentation plots at the end')
+    p.add_argument('--unpaced',action='store_true',help='Process demo/replay as fast as possible')
+    p.add_argument('--demo-hz',type=float,default=240.0)
+    p.add_argument('--scenario',choices=['quad','quad_move','quad_dropout','quad_fast','periodic','noise','global'],default='quad')
+    a=p.parse_args(argv)
+    if a.mode=='demo':a.demo=True
+    if a.mode=='replay':
+        if not a.path:p.error('Use: bash run.sh replay /full/path/events.evs')
+        a.replay=a.path
+    elif a.path:p.error('A positional path is only used in replay mode')
+    if a.demo and a.replay:p.error('Choose synthetic or replay, not both')
+    if a.mode=='record':
+        a.record=True;a.video=True
+        if not a.duration:a.duration=30
+    if a.no_events:a.record=False
+    auto_report=a.report or a.video or a.mode=='photo'
+    try:
+        cfg=load_settings(a.config)
+        if a.band:cfg.min_hz,cfg.max_hz=a.band
+        if a.notch is not None:cfg.notches_hz=tuple(a.notch)
+        cfg.validate()
+        load_activity_settings(a.activity_config,a.activity_preset)
+    except (ValueError,TypeError,OSError) as exc:p.error(str(exc))
+    for name in ['duration','after','photos_every']:
+        if not math.isfinite(getattr(a,name)) or getattr(a,name)<0:p.error(f'{name} must be finite and nonnegative')
+    if 0 < a.photos_every < 1:p.error('Use at least 1 second between native snapshots')
+    if not math.isfinite(a.demo_hz) or not 1<=a.demo_hz<=10000:p.error('Invalid demo-hz')
+    if a.unpaced and not (a.demo or a.replay):p.error('--unpaced requires demo or replay')
+    if a.unpaced and (a.video or a.mode=='photo' or a.photos_every):p.error('Unpaced mode cannot create timing-preserving video/photos. Remove --unpaced.')
+    if a.headless and (a.video or a.rgb is not None or a.mode=='photo' or a.photos_every):p.error('Use --no-window, not --headless, for media capture tests')
+    if a.mode=='photo' and a.duration:p.error('Photo mode ends after its snapshot. Use --after instead of --duration.')
+    if a.replay:
+        a.replay=str(Path(a.replay).expanduser().resolve())
+        if not Path(a.replay).is_file():p.error('Replay file not found')
+    if a.run_dir is None:
+        import re
+        slug=re.sub('[^A-Za-z0-9_-]+','_',a.name).strip('_')[:60]
+        a.run_dir=str(ROOT/'captures'/((slug+'_' if slug else '')+time.strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6]))
+    out=Path(a.run_dir).expanduser().resolve()
+    try:out.mkdir(parents=True,exist_ok=False)
+    except FileExistsError:p.error('Output folder exists. Choose a new run-dir or use --name.')
+    a.run_dir=str(out)
+    print(f'Run folder: {out}',flush=True)
+    if a.record:print('EVENT RECORDING: decoded data uses 13 bytes/event. Check free storage.',flush=True)
+    ctx=mp.get_context('spawn');snapshots=ctx.Queue(maxsize=1);commands=ctx.Queue(maxsize=8)
+    photo_queue=ctx.Queue(maxsize=2);stop=ctx.Event()
+    proc=ctx.Process(target=worker,args=(vars(a),cfg.to_dict(),snapshots,commands,stop,photo_queue),name='EVK4 period worker')
+    proc.start()
+    rgb=None;media=None;markers=None;app_error=None;history=History()
+    snap=dict(kind='status',status='STARTING',published_monotonic=time.monotonic(),synthetic=a.demo,replay=bool(a.replay))
+    pending_photo=None;photo_count=0;auto_photo_sent=False;first_frame_wall=None;last_auto_photo=None
+    overlays=not a.no_overlays;stripped=a.stripped;sequence=0;photo_failure=None
+    last_display=None;render=not a.headless
+    def request_photo(reason):
+        nonlocal pending_photo
+        if pending_photo is not None:return
+        rid=time.strftime('%H%M%S')+'-'+uuid.uuid4().hex[:8]
+        try:commands.put_nowait(dict(type='photo',id=rid))
+        except queue.Full:
+            print('Photo request queue is full. Try again.',flush=True);return
+        pending_photo=dict(id=rid,requested=time.monotonic())
+        if markers:json_line(markers,dict(type='photo_request',id=rid,reason=reason,host_unix=time.time(),sensor_t_us=snap.get('t_us')))
+    try:
+        if render:
+            import cv2
+            if a.rgb is not None:rgb=RGBReader(a.rgb)
+            if not a.no_window:
+                cv2.namedWindow('EVK4 Rotor Lab',cv2.WINDOW_NORMAL)
+                cv2.resizeWindow('EVK4 Rotor Lab',1280,800)
+            # Start movies at the first fresh event preview, not during JIT setup.
+        markers=(out/'markers.jsonl').open('x',buffering=1)
+        next_frame=time.monotonic()
+        while True:
+            try:
+                while True:snap=snapshots.get_nowait()
+            except queue.Empty:pass
+            now=time.monotonic()
+            if is_fresh(snap,cfg,now):
+                if first_frame_wall is None:first_frame_wall=now
+                history.add(snap)
+            rgb_frame=rgb.frame if rgb else None
+            rgb_age=now-rgb.received if rgb and rgb.received is not None else None
+            if render:
+                if a.video and media is None and is_fresh(snap,cfg,now):
+                    media=MediaWriter(out,cfg.preview_hz,a.rgb is not None)
+                last_display=draw_frame(snap,cfg,rgb_frame,rgb_age,a.rgb is not None,stripped,now,
+                                         history,overlays,a.record or a.video,out.name)
+                if not a.no_window:cv2.imshow('EVK4 Rotor Lab',last_display)
+                if media:
+                    raw,filt=clean_panels(snap,cfg,now)
+                    images=dict(dashboard=last_display,raw_events=cv2.resize(raw,(640,360),interpolation=cv2.INTER_NEAREST),
+                                filtered_events=cv2.resize(filt,(640,360),interpolation=cv2.INTER_NEAREST))
+                    if a.rgb is not None:
+                        rgb_image=np.zeros((360,640,3),np.uint8)
+                        if rgb_frame is not None and rgb_age is not None and rgb_age<1:
+                            hh,ww=rgb_frame.shape[:2];k=min(640/ww,360/hh);ww,hh=round(ww*k),round(hh*k)
+                            x,y=(640-ww)//2,(360-hh)//2
+                            rgb_image[y:y+hh,x:x+ww]=cv2.resize(rgb_frame,(ww,hh))
+                        if rgb_frame is None or rgb_age is None or rgb_age>=1:
+                            cv2.putText(rgb_image,'RGB UNAVAILABLE - NOT A DARK SCENE',(20,180),
+                                        cv2.FONT_HERSHEY_SIMPLEX,.55,(235,235,235),1,cv2.LINE_AA)
+                        images['rgb_preview']=rgb_image
+                    fresh=is_fresh(snap,cfg,now)
+                    media.submit(images,dict(gui_sequence=sequence,host_unix=time.time(),host_monotonic=now,
+                        sensor_t_us=snap.get('t_us'),evaluated_monotonic=snap.get('evaluated_monotonic'),
+                        status=snap.get('status') if fresh or snap.get('kind')!='frame' else 'STALE_DATA',
+                        rotor_candidate=int(fresh and snap.get('status')=='RUN' and snap.get('flag',False)),
+                        rgb_received_monotonic=None if rgb is None else rgb.received,
+                        rgb_valid=bool(rgb_frame is not None and rgb_age is not None and rgb_age<1),
+                        rgb_age_ms=None if rgb_age is None else rgb_age*1000))
+                    sequence+=1
+            # The capture bundle is made at one detector evaluation, at native
+            # resolution. Saving it is outside the event-processing worker.
+            while True:
+                try:bundle=photo_queue.get_nowait()
+                except queue.Empty:break
+                bs=bundle['snapshot']
+                composed=draw_frame(dict(bs,captured=True),cfg,rgb_frame,rgb_age,a.rgb is not None,False,
+                                    now=bs['evaluated_monotonic'],history=history,overlays=overlays,recording=a.record or a.video,run_name=out.name)
+                folder=save_photo(out,bundle,composed,
+                                  rgb_frame if rgb_age is not None and rgb_age<1 else None)
+                if pending_photo and bundle['request_id']==pending_photo['id']:pending_photo=None
+                photo_count+=1
+                json_line(markers,dict(type='photo_saved',folder=str(folder.relative_to(out)),sensor_t_us=bs['t_us'],host_unix=time.time()))
+                print(f'Photo saved: {folder}',flush=True)
+            if a.mode=='photo' and photo_count:break
+            if pending_photo and now-pending_photo['requested']>5:
+                photo_failure='No native photo was returned within 5 s. Check input/data quality.'
+                json_line(markers,dict(type='photo_timeout',**pending_photo));pending_photo=None
+                print(photo_failure,flush=True)
+                if a.mode=='photo':break
+            if first_frame_wall is not None and is_fresh(snap,cfg,now):
+                if a.mode=='photo' and not auto_photo_sent and now-first_frame_wall>=a.after:
+                    request_photo('photo_mode');auto_photo_sent=True
+                if a.photos_every and (last_auto_photo is None or now-last_auto_photo>=a.photos_every):
+                    request_photo('interval');last_auto_photo=now
+            if not proc.is_alive():
+                # Give the small photo queue a moment to finish its feeder.
+                if pending_photo:
+                    try:
+                        bundle=photo_queue.get(timeout=.5)
+                        bs=bundle['snapshot']
+                        composed=draw_frame(dict(bs,captured=True),cfg,now=bs['evaluated_monotonic'])
+                        save_photo(out,bundle,composed);photo_count+=1;pending_photo=None
+                    except queue.Empty:pass
+                break
+            key=-1
+            if render and not a.no_window:
+                next_frame+=1/cfg.preview_hz
+                key=cv2.waitKey(max(1,int(max(0,next_frame-time.monotonic())*1000)))&255
+                if cv2.getWindowProperty('EVK4 Rotor Lab',cv2.WND_PROP_VISIBLE)<1:break
+                if time.monotonic()>next_frame+1/cfg.preview_hz:next_frame=time.monotonic()
+            else:time.sleep(.02 if a.headless else 1/cfg.preview_hz)
+            if key in (ord('q'),27):break
+            if key==ord('f'):stripped=not stripped
+            elif key==ord('o'):overlays=not overlays
+            elif key==ord('b'):newest(commands,dict(type='activity_preset'))
+            elif key==ord('n'):newest(commands,dict(type='period_input'))
+            elif key==ord('r'):newest(commands,dict(type='reset'))
+            elif key==ord('a'):newest(commands,dict(type='roi',roi=[0,0,snap.get('width',1280),snap.get('height',720)]))
+            elif key==ord('s'):request_photo('manual')
+            elif key in (ord('m'),ord('1'),ord('2')):
+                label='operator_target_present' if key==ord('1') else ('operator_target_absent' if key==ord('2') else 'marker')
+                json_line(markers,dict(type=label,host_unix=time.time(),sensor_t_us=snap.get('t_us'),note='User annotation, not automatic ground truth'))
+                print('MARKER:',label,flush=True)
+            elif key==ord('c') and is_fresh(snap,cfg):
+                from ui import polarity_image
+                image=polarity_image(snap['raw'])
+                x,y,w,h=map(int,cv2.selectROI('Analysis ROI, Enter to accept',image,False,False))
+                cv2.destroyWindow('Analysis ROI, Enter to accept')
+                if w and h:
+                    rw=snap['width']/image.shape[1];rh=snap['height']/image.shape[0]
+                    roi=[int(x*rw),int(y*rh),min(snap['width'],int((x+w)*rw)),min(snap['height'],int((y+h)*rh))]
+                    newest(commands,dict(type='roi',roi=roi))
+                    json_line(markers,dict(type='roi_request',roi=roi,host_unix=time.time(),sensor_t_us=snap.get('t_us')))
+    except KeyboardInterrupt:pass
+    except BaseException as exc:
+        app_error=f'{type(exc).__name__}: {exc}';traceback.print_exc()
+        (out/'APP_ERROR.txt').write_text(app_error+'\n')
+    finally:
+        stop.set()
+        # Drain large native snapshots while joining so a queue feeder cannot
+        # deadlock the worker at shutdown.
+        deadline=time.monotonic()+15
+        while proc.is_alive() and time.monotonic()<deadline:
+            for channel in (photo_queue,snapshots):
+                try:channel.get_nowait()
+                except (queue.Empty,EOFError,OSError):pass
+            proc.join(timeout=.1)
+        if proc.is_alive():
+            proc.terminate();proc.join(timeout=3)
+            (out/'FORCED_STOP.txt').write_text('Worker did not stop cleanly. Recording completeness unknown.\n')
+        if rgb:
+            rgb.stop.set();rgb.thread.join(timeout=2)
+            if rgb.received is None:
+                app_error=app_error or 'No RGB frames received. EVK4 files may still be usable, but not as an RGB comparison.'
+        if media:
+            info=media.close()
+            if info['error']:app_error=app_error or info['error']
+        if a.video and media is None:
+            app_error=app_error or 'No fresh preview was available, so no movie was opened.'
+            (out/'VIDEO_ERROR.txt').write_text(app_error+'\n')
+        if markers:markers.close()
+        if render and not a.no_window:
+            import cv2
+            cv2.destroyAllWindows()
+        snapshots.close();commands.close();photo_queue.close()
+        if a.mode=='photo' and not photo_count:
+            photo_failure=photo_failure or 'Source ended before a fresh native snapshot could be saved.'
+        if photo_failure:(out/'PHOTO_ERROR.txt').write_text(photo_failure+'\n')
+        (out/'application_summary.json').write_text(json.dumps(dict(photos=photo_count,error=app_error,
+              photo_error=photo_failure,source_exitcode=proc.exitcode,closed_unix=time.time()),indent=2))
+    if auto_report and (out/'session.json').exists():
+        print('Exporting per-run CSVs and presentation graphs...',flush=True)
+        try:
+            from report import export_report
+            print('Report:',export_report(out),flush=True)
+        except Exception as exc:
+            (out/'REPORT_ERROR.txt').write_text(str(exc)+'\n');print('Report failed:',exc,flush=True)
+            app_error=app_error or str(exc)
+    print(f'Saved: {out}\nCheck summary.json and media.json before using this as experimental evidence.',flush=True)
+    if app_error or photo_failure or (out/'FORCED_STOP.txt').exists():return 1
+    if (out/'summary.json').exists():
+        result=json.loads((out/'summary.json').read_text())
+        if result.get('status')=='ERROR' or result.get('recording_error'):return 1
+        if a.record and not result.get('no_observed_recording_loss',False):return 2
+        return 0
+    return 1
+
+
+if __name__=='__main__':
+    mp.freeze_support()
+    raise SystemExit(main())
