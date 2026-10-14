@@ -1,0 +1,14 @@
+{
+  "basis": "Supplied evk4_rotor_lab_v03.zip. Exact installed September 15 run has not been provided.",
+  "unchanged": {
+    "rotor.py": "b91dd5503678a8f48d394644d4d22d194ad7b0cfbc2b1c166c5b15da53952b1f",
+    "ui.py": "0137132b3c9e1e1b933f650b9200cb83ad3c0fd0db5a657fc191f820dd41d4df",
+    "settings.json": "7636b332ffe55214881063e0aeda16e50ce96c4430482858a4358a5166caeb39",
+    "event_io.py": "0c91edb03b7a2edc0c0fe46ee23213140031285b01f4e40f5b8878be63ed590f",
+    "media.py": "8b02783695b71ac54cb97d0ea0aef09bb484b6d2880449216a1c47c7a346decd",
+    "report.py": "3f96400831b220dce2dfcf37d4cbbf830c359401b33961a65f68c389bd409ca3",
+    "requirements.txt": "9ba10e1da5a454c9bd3419ffdc995d6445e770ce1c001d3fe60b7cc0f1febbc8"
+  },
+  "app_original_sha256": "1217ff5a4e56fe3b8bb5cdd41c68ce02c4ff7c1540ed7cc5e6b5eb83796b1575",
+  "app_startup_patch_sha256": "61a49f2808593f3ec7df1c2dac66ffc935d7191bd232846e838a35171b60fcf6"
+}

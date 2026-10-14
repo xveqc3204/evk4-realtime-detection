@@ -1,0 +1,22 @@
+{
+  "min_hz": 80.0,
+  "max_hz": 1200.0,
+  "cycles": 4,
+  "period_tolerance": 0.2,
+  "edge_guard_us": 40,
+  "notches_hz": [],
+  "notch_width_hz": 5.0,
+  "min_pixels": 6,
+  "group_cell_px": 8,
+  "max_regions": 32,
+  "global_tile_fraction": 0.35,
+  "confirm_ms": 60.0,
+  "clear_ms": 120.0,
+  "association_px": 80.0,
+  "update_ms": 20.0,
+  "view_ms": 33.0,
+  "max_delay_ms": 40.0,
+  "max_backlog": 64,
+  "silence_ms": 500.0,
+  "preview_hz": 20.0
+}

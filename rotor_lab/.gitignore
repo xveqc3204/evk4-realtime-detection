@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.nbc
+*.nbi
+captures/
+.DS_Store
+validation/local_*/
+validation/local_preflight.json
+# Never commit experiment payloads or credentials.
+*.evs
+*.raw
+*.mp4
+*.avi
+*.mov
+*.hdf5
+.env
+.env.*
+*.pem
+*.key
+*.token
+secrets/
+credentials/
+.activity_patch_state.json
