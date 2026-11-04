@@ -1,5 +1,13 @@
 # Project status
 
+## Working files and data
+
+Use the existing `evk4-realtime-detection` checkout for ongoing source edits.
+The cloud-ready collection is in the ignored `local-project/` folder on the local
+Mac. It contains the reviewed recordings, project/admin files and the run log.
+GitHub holds source and technical documentation; Drive uploads remain a separate,
+manual step. This organization does not change capture paths or detection behavior.
+
 ## Current application
 
 The activity-first GUI is versioned in `rotor_lab/`. Use `bash run.sh` from the

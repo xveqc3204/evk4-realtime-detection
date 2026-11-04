@@ -31,3 +31,8 @@ neuromorphic-drivers/
 secrets/
 credentials/
 .activity_patch_state.json
+
+# Local project documents and the complete cloud-ready data collection
+# No trailing slash: protect either a real folder or a local shortcut.
+/local-project
+/AE27 EBS - Cloud Folder

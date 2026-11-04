@@ -9,6 +9,29 @@ The purpose is to cue observation from raw activity first and add periodic
 and possible-drone evidence when available. This is an experimental sensor,
 not a validated drone classifier. No range, depth, or angular bearing is inferred.
 
+## One working folder
+
+Use the existing `~/evk4-realtime-detection` checkout for ongoing edits.
+The Desktop shortcut **AE27 EBS - Working Repository** opens that same folder.
+The separate `ece487-labs-xveqc3204` repository is coursework.
+
+| Location | Use | Storage |
+|---|---|---|
+| `rotor_lab/` | Current application source | GitHub |
+| `docs/` | Technical testing instructions | GitHub |
+| `rotor_lab/captures/` | Default location for new recordings | Local, ignored by Git |
+| `local-project/AE27 EBS - Cloud Folder/` | Reviewed runs, screenshots, project documents and review log | Local working files; upload to Drive |
+| `legacy/` | Preserved earlier prototypes | GitHub |
+
+The cloud folder is local to this Mac and is not included in a Git clone.
+Its **Read Me First.docx** explains the review/upload routine. **Run Review Log.xlsx**
+holds the review decisions and screenshot sources. The existing Desktop cloud-folder
+shortcut points to this same location; it is not another copy.
+
+Keep full recordings, signed forms, budgets and project administration in the
+local cloud folder. This repository is public. GitHub is for source code and
+technical documentation; it is not the backup for the full data collection.
+
 ## Start
 
 Close any other EVK4 program. From the repository root:
@@ -143,25 +166,55 @@ distance trials appear in its figures. Raw/filtered visibility and cue-on-target
 association require review. Whole-view rates/counts are not segmented target
 measurements. A single run per condition is not detection probability.
 
-## Tonight's test plan
+## Controlled testing
 
 Follow [docs/TESTING.md](docs/TESTING.md). Keep the camera fixed and thresholds
 unchanged during a sweep. Record one target-present/absent marker pair per trial.
 Compare settings on identical recorded events before selecting a new default.
 
-## Updating main
+## After a recording
 
-Use main directly as requested. Inspect before staging:
+1. Verify the finished run. Use the review command for distance trials; inspect
+   the videos and logs for other captures. `latest` refers to a distance trial;
+   use an absolute folder path for other runs.
+2. Copy the complete run from `rotor_lab/captures/` into the cloud folder's
+   `02 Run Data/To Review/<date>/`. Keep the original capture in place so existing
+   latest-run pointers continue to work.
+3. Record the review decision in **Run Review Log.xlsx** and sort the working copy
+   into Keep, Unsure or Reject. Replay and synthetic inputs stay clearly labeled.
+4. Upload the new run and any new screenshots to the matching Drive folders.
+   Update the existing cloud copy of the log using Drive's **Upload new version**.
+
+Git commits do not upload these recordings or update Drive. Keep each run's event
+files, videos, settings, review records and logs together. Keep means retained for
+analysis; it does not certify a successful drone detection.
+
+## Updating the repository
+
+Edit the files in this checkout instead of exporting another application copy
+from Downloads. Before starting, check the working tree. When it is clean, bring
+in remote changes with a fast-forward-only pull:
 
 ```bash
+cd ~/evk4-realtime-detection
 git status --short --branch
-git diff
+git pull --ff-only
 ```
 
-Stage only the specific files changed, review `git diff --cached`, commit, then
-`git push origin main`. Do not use force-push or `git add .` for experiment data.
-Environments, captures, common credentials, and large sensor/video files are
-ignored. Ignore patterns do not remove a file already tracked by Git.
+If there are unfinished edits, finish or commit them before pulling. After editing,
+run `bash run.sh test` for application changes and inspect `git diff`. Stage only
+the files intended for the public repository. For example, for a README-only edit:
 
-The old export manifest is provenance of the GUI import, not the file list for
-future commits. You no longer need to export from Downloads on each update.
+```bash
+git add README.md
+git diff --cached
+git commit -m "Update project documentation"
+git push origin main
+```
+
+For a code change, stage the specific source files instead. If the staged diff
+is empty, skip the commit; push only existing local commits if needed. Use
+meaningful commit messages. Do not force-push or use `git add .` for a data-collection session.
+`local-project`, captures, environments and recorded media are ignored. Ignore
+rules do not remove a file already tracked by Git. The old GUI export manifest is
+historical provenance, not a list of files to export for each update.
