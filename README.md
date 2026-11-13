@@ -1,5 +1,17 @@
 # EVK4 Real-Time Detection
 
+<!-- EBS_CROSS_PLATFORM_GUI -->
+## Recording GUI on macOS and Windows
+
+The **EVK4 detector and recording pipeline are unchanged**. Open the experiment control GUI without a camera connected.
+
+- **macOS:** double-click `~/Applications/EBS Field Tests.app` after running `bash "Install EBS Desktop App.command"`, or use `bash "Start EBS Tests.command"`. Stop using **STOP & SAVE**.
+- **Windows 11 x64:** double-click **`Start EBS Tests.bat`**. Set up Python 3.10 with tkinter and the pinned camera requirements first. To finish early, click the EVK4 dashboard and press **Q**, then let the GUI finalize the take. The Windows control window does **not** send a potentially destructive OS terminate signal.
+
+See [platform setup](docs/PLATFORM_SETUP.md) for initial Windows camera-driver checks and the test procedure. Camera discovery and recording on Windows must be validated on the actual EVK4 and computer before comparing with Mac runs.
+<!-- END EBS_CROSS_PLATFORM_GUI -->
+
+
 Live event-based activity cueing with a Prophesee EVK4. The current GUI and
 experiments are in **`rotor_lab/`**. The original terminal prototypes are
 preserved in **`legacy/`**. Run the current application from this repository,

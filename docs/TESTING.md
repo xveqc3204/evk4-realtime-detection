@@ -215,3 +215,9 @@ check source_clears/processing_overruns/recording errors, and copy data to backu
 storage. Do not delete recordings merely because a summary CSV exists. At
 5 Mev/s, each minute of decoded events is about 3.9 GB before video; seven such
 runs need about 27.3 GB plus video. Real event rate varies substantially.
+
+<!-- EBS_CROSS_PLATFORM_DOC_LINK -->
+## macOS and Windows
+
+Both systems use the same detector and original-event format. The launchers and Windows stop control differ; for the verified procedure, see [platform setup](PLATFORM_SETUP.md).
+<!-- END EBS_CROSS_PLATFORM_DOC_LINK -->

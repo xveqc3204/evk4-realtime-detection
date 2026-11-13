@@ -32,3 +32,7 @@ GUI drawing, acquisition, queues, data-loss guards, media encoding, or replay
 signal processing. Generic record mode and distance trials default to 60 s.
 `--duration` overrides live-capture duration. Live monitoring is unlimited;
 replay processes the original file to EOF.
+
+<!-- EBS_CROSS_PLATFORM_DOC_LINK -->
+For recording-GUI startup on macOS and Windows, see [platform setup](../docs/PLATFORM_SETUP.md). The unchanged detector and recorded data have the same format on both systems.
+<!-- END EBS_CROSS_PLATFORM_DOC_LINK -->
