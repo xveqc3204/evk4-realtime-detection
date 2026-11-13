@@ -21,6 +21,8 @@ import sys
 import time
 import uuid
 
+from focus_preview import FocusSession
+
 ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parent
 INDEX_COLUMNS = [
@@ -318,8 +320,8 @@ def run_gui() -> None:
     probe = {"busy": False, "checked_python": False, "usb_kind": "checking", "next_at": 0.0}
     ui = tk.Tk()
     ui.title('EBS Field Tests | Recording Control')
-    ui.geometry('850x790')
-    ui.minsize(760, 695)
+    ui.geometry('850x870')
+    ui.minsize(760, 790)
     ui.option_add('*Font', 'Helvetica 12')
     styles = ttk.Style(ui)
     if 'clam' in styles.theme_names():
@@ -346,6 +348,7 @@ def run_gui() -> None:
     last_run_label = tk.StringVar(value='No recording this session')
     runtime = {'proc': None, 'run': None, 'meta': None, 'log': None,
                'started': None, 'stop_requested': False, 'finalized': False, 'dataset': None}
+    focus = FocusSession()
 
     outer = ttk.Frame(ui, padding=10)
     outer.pack(fill='both', expand=True)
@@ -419,6 +422,10 @@ def run_gui() -> None:
             subprocess.Popen(['xdg-open', str(folder)])
 
     def start():
+        if focus.running:
+            messagebox.showinfo('Finish focusing first',
+                'Click Finish focusing and wait for the raw window to close before recording.')
+            return
         if runtime['proc'] is not None and runtime['proc'].poll() is None:
             return
         if probe['usb_kind'] == 'disconnected':
@@ -476,6 +483,7 @@ def run_gui() -> None:
             last_run_label.set(stamp)
             status.set('STARTING CAMERA ...')
             start_button.configure(state='disabled')
+            focus_button.configure(state='disabled')
             stop_button.configure(state='normal')
         except Exception as exc:
             messagebox.showerror('Could not start', str(exc))
@@ -499,6 +507,31 @@ def run_gui() -> None:
             status.set('STOP REQUESTED | Finalizing files. Keep this window open.')
         except OSError as exc:
             messagebox.showerror('Stop failed', str(exc))
+
+    def toggle_focus():
+        if focus.running:
+            focus.stop()
+            focus_button.configure(text='Closing focus preview...', state='disabled')
+            status.set('CLOSING FOCUS | Waiting for camera release. No recording was made.')
+            return
+        if runtime['proc'] is not None and runtime['proc'].poll() is None:
+            return
+        if probe['busy']:
+            messagebox.showinfo('Camera status check', 'Wait for the connection check to finish, then click Focus camera.')
+            return
+        if camera_py is None or probe['usb_kind'] == 'disconnected':
+            messagebox.showinfo('Connect the camera', 'Connect the EVK4 and check Recording software: READY, then try Focus camera.')
+            return
+        try:
+            focus.start(camera_py)
+            start_button.configure(state='disabled')
+            focus_button.configure(text='Finish focusing')
+            status.set('FOCUS ONLY | Raw view. Nothing is recorded or added to the dataset.')
+        except Exception as exc:
+            messagebox.showerror('Focus preview failed', str(exc))
+
+    focus_button = ttk.Button(line, text='Focus camera (no recording)', command=toggle_focus)
+    focus_button.pack(side='left', fill='x', expand=True, padx=3)
 
     start_button = ttk.Button(line, text='START RECORDING', command=start)
     start_button.pack(side='left', fill='x', expand=True, padx=3)
@@ -579,7 +612,7 @@ def run_gui() -> None:
     ttk.Button(actionrow, text='Attach reference video', command=attach_reference).pack(side='left', padx=3)
 
     def refresh_connection(force_python=False):
-        if probe['busy']:
+        if probe['busy'] or focus.running:
             return
         if runtime['proc'] is not None and runtime['proc'].poll() is None:
             return  # no background USB probes while recording
@@ -598,7 +631,7 @@ def run_gui() -> None:
                command=lambda: refresh_connection(force_python=(camera_py is None))).pack(side='right', padx=6)
 
     guidance = ttk.Label(outer,
-        text='In the camera window: press 1 when the target enters, 2 when it leaves, S for a photo.\n'
+        text='Finish focusing before recording. In dashboard: 1 target present, 2 absent, S photo.\n'
              'Records events, dashboard/raw/filtered videos, logs and plots.\n'
              'macOS: Stop & Save. Windows: press Q in the camera window; controller finalizes the take.',
         justify='left', wraplength=710)
@@ -622,7 +655,7 @@ def run_gui() -> None:
                 if probe['checked_python']:
                     python_status.set('Recording software: READY' if camera_py is not None
                                       else 'Recording software: NOT FOUND (check Python environment)')
-                if runtime['proc'] is None:
+                if runtime['proc'] is None and not focus.running:
                     status.set('OFFLINE | Ready to record' if camera_py is not None and kind=='connected'
                                else 'OFFLINE | GUI ready. Connect camera when available.')
         except queue.Empty:
@@ -647,13 +680,26 @@ def run_gui() -> None:
                 status.set(f"FINISHED | {quality.get('recording_status')} | code {rc}")
                 stop_button.configure(state='disabled')
                 start_button.configure(state='normal')
+                focus_button.configure(state='normal')
                 if quality.get('recording_status') != 'RECORDED_UNREVIEWED':
                     messagebox.showwarning('Review recording quality',
                         'The run finished, but data integrity needs review.\n'
                         f"Status: {quality.get('recording_status')}\n"
                         'Keep the complete run and inspect summary.json and the GUI log.\n'
                         'Never count invalid data as a negative detection.')
-        if (p is None or p.poll() is not None) and not probe['busy'] and \
+        focus_done = focus.collect_exit()
+        if focus_done is not None:
+            focus_button.configure(text='Focus camera (no recording)', state='normal')
+            start_button.configure(state='normal')
+            rc, detail = focus_done
+            status.set('FOCUS CLOSED | No files saved. Ready for a test.' if rc == 0
+                       else 'FOCUS FAILED | No recording made. Check connection.')
+            probe['next_at'] = 0.0
+            if rc != 0:
+                messagebox.showerror('Focus preview failed', detail or f'Preview exited with code {rc}.')
+        if focus.running:
+            usb_status.set('Camera USB: Focus preview active; connection checks paused')
+        if (p is None or p.poll() is not None) and not focus.running and not probe['busy'] and \
            time.monotonic() >= probe['next_at']:
             refresh_connection()
         if p is not None and p.poll() is None:
@@ -661,6 +707,11 @@ def run_gui() -> None:
         ui.after(800, poll)
 
     def exit_app():
+        if focus.running:
+            focus.stop()
+            focus_button.configure(text='Closing focus preview...', state='disabled')
+            status.set('Closing focus. Wait for camera release, then close this control window.')
+            return
         p = runtime['proc']
         if p is not None and p.poll() is None:
             messagebox.showwarning('Recording in progress',
